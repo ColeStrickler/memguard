@@ -69,6 +69,11 @@
 #elif defined(__x86_64__) || defined(__i386__)
 #  define PMU_LLC_MISS_COUNTER_ID 0x08b0 // OFFCORE_REQUESTS.ALL_DATA_RD
 #  define PMU_LLC_WB_COUNTER_ID   0x40b0 // OFFCORE_REQUESTS.WB
+#elif defined(__riscv)
+// Note: These performance counters are specific to the T-Head C910.
+// 		 They may not function correctly on other RISC-V designs.
+#  define PMU_LLC_MISS_COUNTER_ID 0x11   // LL_CACHE_READ_MISS
+#  define PMU_LLC_WB_COUNTER_ID   0x13   // LL_CACHE_WRITE_MISS
 #endif
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0) // somewhere between 4.4-4.10
