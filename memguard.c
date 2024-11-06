@@ -42,6 +42,10 @@
 #include <linux/kthread.h>
 #include <linux/printk.h>
 #include <linux/interrupt.h>
+#include <linux/of.h>
+#include <linux/of_irq.h>
+#include <linux/platform_device.h>
+
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(5, 0, 0)
 #  include <uapi/linux/sched/types.h>
@@ -51,7 +55,7 @@
 #  include <linux/sched/rt.h>
 #endif
 #include <linux/sched.h>
-
+#define FIRESIM
 /**************************************************************************
  * Public Definitions
  **************************************************************************/
@@ -62,6 +66,82 @@
 #define DEFAULT_RD_BUDGET_MB 1000
 #define DEFAULT_WR_BUDGET_MB  500
 #define DEFAULT_QMIN_MB       500
+#define uint64_t __u64
+
+
+
+#define WRITE_BOOL(addr, value)(*(bool*)(addr) = value)
+#define WRITE_UINT8(addr, value)(*(uint8_t*)(addr) = value)
+#define WRITE_UINT16(addr, value)(*(uint16_t*)(addr) = value)
+#define WRITE_UINT32(addr, value)(*(uint32_t*)(addr) = value)
+#define WRITE_UINT64(addr, value)(*(uint64_t*)(addr) = value)
+
+#define READ_BOOL(addr)(*(bool*)(addr))
+#define READ_UINT8(addr)(*(uint8_t*)(addr))
+#define READ_UINT16(addr)(*(uint16_t*)(addr))
+#define READ_UINT32(addr)(*(uint32_t*)(addr))
+#define READ_UINT64(addr)(*(uint64_t*)(addr))
+
+#ifdef FIRESIM
+
+uint64_t PLIC_physAddr = 0;
+uint64_t L2CACHE_physAddr = 0;
+#define PLIC_BASE_OFFSET 0xC000000
+#define PLIC_BASE_ADDR PLIC_physAddr // WE MUST MAP THIS INTO VIRTUAL ADDRESS SPACE
+#define PLIC_MAX_OFFSET 0x3FFFFFC
+#define L2CACHE_BASE_OFFSET 0x2010000
+#define L2CACHE_BASE_ADDR L2CACHE_physAddr
+#define L2CACHE_ACCESS_COUNTER_ADDR(core) ((L2CACHE_BASE_ADDR + 0x20 + (core * 0x8)))
+#define L2CACHE_MISS_COUNTER_ADDR(core) ((L2CACHE_BASE_ADDR + 0x100 + (core * 0x8)))
+#define L2CACHE_EN_COUNT_INSTFETCH_ADDR ((L2CACHE_BASE_ADDR + 0x300))
+#define L2CACHE_EN_CORE_INTERRUPT_ADDR(core) ((L2CACHE_BASE_ADDR + 0x308 + (core * 0x8)))
+#define L2CACHE_CORE_BUDGET_ADDR(core) ((L2CACHE_BASE_ADDR + 0X400 + (core * 8)))
+#define L2CACHE_PERIOD_LEN_ADDR ((L2CACHE_BASE_ADDR + 0x500))
+void PLIC_EnableSource(uint64_t base, int ctx, int src) 
+{
+    uint64_t addr = base + 0x2000 + (ctx*0x80);
+    uint32_t currVal = READ_UINT32(addr);
+    currVal |= (1 << ctx);
+    WRITE_UINT32(addr, currVal);
+}
+void PLIC_SetSourcePriority(uint64_t base, int src, int priority)
+{
+    uint64_t addr = base + (src*0x4);
+    WRITE_UINT32(addr, priority);
+}
+void PLIC_SetContextThreshold(uint64_t base, int ctx, int threshold)
+{
+    uint64_t addr = base + 0x200000 + (0x1000 * ctx);
+    WRITE_UINT32(addr, threshold);
+}
+/*
+    Only works for interrupt sources 0-31
+*/
+int PLIC_ReadPendingBit(uint64_t base, int src)
+{
+    uint64_t addr = base + 0x1000;
+    uint32_t val = READ_UINT32(addr);
+    return (val >> src) & 0x1;
+}
+void PLIC_ClearPendingBit(uint64_t base, int src)
+{
+    uint64_t addr = base + 0x1000;
+    uint32_t val = READ_UINT32(addr);
+    val &= ~(1 << src); // clear bit
+    WRITE_UINT32(addr, val);
+}
+
+void PLIC_Setup(uint64_t base, int cpu)
+{
+	int pending = PLIC_ReadPendingBit(base, cpu+1);
+	if (pending)
+		PLIC_ClearPendingBit(base, cpu+1);
+	PLIC_SetSourcePriority(base, cpu+1, 5);
+	PLIC_SetContextThreshold(base, cpu, 0); // Let everything through > threshold 0=everything
+	PLIC_EnableSource(base, cpu, cpu+1); // Sources start from 1 not 0
+}
+
+#endif
 
 #if defined(__aarch64__) || defined(__arm__)
 #  define PMU_LLC_MISS_COUNTER_ID 0x17   // LINE_REFILL
@@ -101,6 +181,13 @@ struct memstat{
 
 /* percpu info */
 struct core_info {
+#ifdef FIRESIM
+	/* linux virtual IRQ # - Firesim only */
+	int irq;
+	int cpunum;
+	int isThrottled;
+#endif
+
 	/* user configurations */
 	int read_limit;          /* read limit mode */
 	int write_limit;	 /* write limit mode */
@@ -249,7 +336,11 @@ static inline u64 perf_event_count(struct perf_event *event)
 /** return used event in the current period */
 static inline u64 memguard_read_event_used(struct core_info *cinfo)
 {
+#ifdef FIRESIM
+	return READ_UINT64(L2CACHE_MISS_COUNTER_ADDR(cinfo->cpunum));
+#else
 	return perf_event_count(cinfo->read_event) - cinfo->old_read_val;
+#endif
 }
 
 /** return used event in the current period */
@@ -365,6 +456,12 @@ void update_statistics(struct core_info *cinfo)
 /**
  * budget is used up. PMU generate an interrupt
  * this run in hardirq, nmi context with irq disabled
+ * 
+ * this is called from kernel/events/core.c in the function:
+ *  static int __perf_event_overflow(struct perf_event *event,
+ *			 int throttle, struct perf_sample_data *data,
+ *			 struct pt_regs *
+ * 
  */
 static void event_overflow_callback(struct perf_event *event,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 2, 0)
@@ -400,7 +497,10 @@ static void __unthrottle_core(void *info)
 	if (cinfo->throttled_task) {
 		cinfo->exclusive_mode = 1;
 		cinfo->exclusive_time = ktime_get();
-
+#ifdef FIRESIM
+		// Re-enable interrupts
+		WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(cinfo->cpunum), true);
+#endif
 		cinfo->throttled_task = NULL;
 		DEBUG_RECLAIM(trace_printk("exclusive mode begin\n"));
 	}
@@ -408,6 +508,8 @@ static void __unthrottle_core(void *info)
 
 static void __newperiod(void *info)
 {
+
+
 	ktime_t start = ktime_get();
 	struct memguard_info *global = &memguard_info;
 	struct core_info *cinfo = this_cpu_ptr(core_info);
@@ -425,6 +527,11 @@ static void __newperiod(void *info)
 /**
  * memory overflow handler.
  * must not be executed in NMI context. but in hard irq context
+ * 
+ * 
+ * We enqueue this function as IRQ_WORK, set up in driver_init
+ * 
+ * 
  */
 static void memguard_read_process_overflow(struct irq_work *entry)
 {
@@ -481,8 +588,12 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 		}
 	}
 
-        /* no more overflow interrupt */
+    /* no more overflow interrupt -->  Will get reset on new period */
+#ifdef FIRESIM
+	WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(cinfo->cpunum), false);
+#else
 	local64_set(&cinfo->read_event->hw.period_left, 0xfffffff);
+#endif
 
 	/* check if we donated too much */
 	if (read_budget_used < cinfo->read_budget) {
@@ -495,9 +606,29 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 		cinfo->throttled_task = NULL;
 		return;
 	}
+
+
+#ifdef FIRESIM
+	/*
+		If throttle mask is set and we get another interrupt, it means
+		that this is a new period and we unthrottle the CPU
+	*/
+	if (cpumask_test_cpu(smp_processor_id(), global->throttle_mask))
+	{
+		memguard_on_each_cpu_mask(global->throttle_mask, __unthrottle_core, NULL, 0);
+	}
+#endif
+
+
+
+
 	/* we are going to be throttled */
 	cpumask_set_cpu(smp_processor_id(), global->throttle_mask);
 	smp_mb(); // w -> r ordering of the local cpu.
+
+
+
+#ifndef FIRESIM
 	if (cpumask_equal(global->throttle_mask, global->active_mask)) {
 		/* all other cores are alreay throttled */
 		if (g_use_exclusive == 2) {
@@ -518,7 +649,7 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 			return;
 		}
 	}
-
+#endif
 	if (cinfo->prev_read_throttle_error)
 		return;
 	/*
@@ -590,8 +721,9 @@ static void memguard_write_process_overflow(struct irq_work *entry)
 		}
 	}
 
+#ifndef FIRESIM // no perf events created
 	local64_set(&cinfo->write_event->hw.period_left, 0xfffffff);
-
+#endif
 	if (write_budget_used < cinfo->write_budget) {
 		trace_printk("ERR: throttling error\n");
 		cinfo->prev_write_throttle_error = 1;
@@ -745,6 +877,10 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 
 static struct perf_event *init_counter(int cpu, int budget, int counter_id, void *callback)
 {
+
+#ifdef FIRESIM // we do not have to deal with callbacks
+	WRITE_UINT32(L2CACHE_CORE_BUDGET_ADDR(cpu), budget);
+#else
 	struct perf_event *event = NULL;
 	struct perf_event_attr sched_perf_hw_attr = {
 		.type		= PERF_TYPE_RAW,
@@ -755,7 +891,6 @@ static struct perf_event *init_counter(int cpu, int budget, int counter_id, void
 		.sample_period  = budget, 
 		.exclude_kernel = 1,   /* TODO: 1 mean, no kernel mode counting */
 	};
-
 	/* Try to register using hardware perf events */
 	event = perf_event_create_kernel_counter(
 		&sched_perf_hw_attr,
@@ -780,11 +915,16 @@ static struct perf_event *init_counter(int cpu, int budget, int counter_id, void
 			       cpu, PTR_ERR(event));
 		return NULL;
 	}
+#endif
+
 
 	/* success path */
 	pr_info("cpu%d enabled counter 0x%x\n", cpu, counter_id);
-
+#ifdef FIRESIM
+	return NULL;
+#else
 	return event;
+#endif
 }
 
 static void __start_counter(void *info)
@@ -892,6 +1032,10 @@ static void __update_budget(void *info)
 		pr_info("ERR: Requested budget is zero\n");
 		return;
 	}
+
+#ifdef FIRESIM
+	WRITE_UINT64(L2CACHE_CORE_BUDGET_ADDR(cinfo->cpunum), (unsigned long)info);
+#endif
 	cinfo->read_limit = (unsigned long)info;
 	DEBUG_USER(trace_printk("MSG: New read budget of Core%d is %d\n",
 				smp_processor_id(), cinfo->read_budget));
@@ -901,11 +1045,14 @@ static void __update_budget(void *info)
 static void __update_write_budget(void *info)
 {
 	struct core_info *cinfo = this_cpu_ptr(core_info);
-
+	
 	if ((unsigned long)info == 0) {
 		pr_info("ERR: Requested budget is zero\n");
 		return;
 	}
+#ifdef FIRESIM
+	WRITE_UINT64(L2CACHE_CORE_BUDGET_ADDR(cinfo->cpunum), (unsigned long)info);
+#endif
 	cinfo->write_limit = (unsigned long)info;
 	DEBUG_USER(trace_printk("MSG: New write budget of Core%d is %d\n",
 				smp_processor_id(), cinfo->write_budget));
@@ -1179,11 +1326,67 @@ static int throttle_thread(void *arg)
 	return 0;
 }
 
+
+#ifdef FIRESIM
+typedef irqreturn_t (*hwirq_handler)(int, void *);
+int RegisterIRQ(struct core_info* cinfo, int cpunum, hwirq_handler handler)
+{
+    struct device_node *node;
+    int ret = 0;
+	int irq = 0;
+    int online_cpus = num_online_cpus();
+    // Locate device node from the device tree
+    node = of_find_compatible_node(NULL, NULL, "sifive,inclusivecache0");
+    if (!node) {
+        pr_err("Failed to find device node\n");
+        return -ENODEV;
+    }
+
+    irq = of_irq_get(node, cpunum);  // 0 = first interrupt in "interrupts" property
+    if (irq < 0) {
+        pr_err("Failed to get IRQ from device tree\n");
+        return irq;
+    }
+    pr_info("Mapped hwirq to Linux IRQ: %d\n", irq);
+
+    ret = request_irq(irq, handler, 0, "memguard", NULL);
+    if (ret) {
+        printk(KERN_ERR "Failed to request IRQ %d --> %d\n", irq, ret);
+        return ret;
+    }
+	cinfo->irq = irq; // This is the virtual
+	return 0; 
+}
+
+
+/*
+	This does the same thing as event_overflow_callback()
+*/
+static irqreturn_t my_irq_handler(int irq, void *dev_id) {
+    struct core_info *cinfo = this_cpu_ptr(core_info);
+	BUG_ON(!cinfo);
+	irq_work_queue(&cinfo->read_pending);
+    return IRQ_HANDLED; // Return IRQ_HANDLED to indicate that it was handled
+}
+#endif
+
+
 int init_module( void )
 {
 	int i;
 
 	struct memguard_info *global = &memguard_info;
+#ifdef FIRESIM
+	PLIC_physAddr = (uint64_t)phys_to_virt(PLIC_BASE_OFFSET);
+	L2CACHE_physAddr = (uint64_t)phys_to_virt(L2CACHE_BASE_OFFSET);
+
+	if (!PLIC_physAddr || ! L2CACHE_physAddr)
+	{
+		printk(KERN_INFO "Could not map L2 or PLIC MMIO registers\n");
+		return -ENODEV;
+	}
+#endif
+
 
 	/* initialized memguard_info structure */
 	memset(global, 0, sizeof(struct memguard_info));
@@ -1215,6 +1418,12 @@ int init_module( void )
 		struct core_info *cinfo = per_cpu_ptr(core_info, i);
 		int read_budget, write_budget;
 
+
+#ifdef FIRESIM
+		pr_info("RegisterIRQ() for cpu %d\n", i);
+		RegisterIRQ(core_info, i, my_irq_handler);
+		cinfo->cpunum = i;
+#endif
 		/* initialize counter h/w & event structure */
 		read_budget = convert_mb_to_events(DEFAULT_RD_BUDGET_MB);
 		write_budget = convert_mb_to_events(DEFAULT_WR_BUDGET_MB);
@@ -1223,13 +1432,21 @@ int init_module( void )
 		memset(cinfo, 0, sizeof(struct core_info));
 
 		/* create performance counter */
+		
+#ifndef FIRESIM // We are using only DRAM accesses
 		cinfo->read_event = init_counter(i, read_budget, g_read_counter_id,
 						 event_overflow_callback);
 		cinfo->write_event = init_counter(i, write_budget, g_write_counter_id,
 						  event_write_overflow_callback);
+#else
+	init_counter(i, read_budget, g_read_counter_id,
+						 event_overflow_callback);
+#endif
+
+#ifndef FIRESIM
 		if (!cinfo->read_event || !cinfo->write_event)
 			break;
-
+#endif
 		/* initialize budget */
 		cinfo->read_budget = cinfo->read_limit = cinfo->read_event->hw.sample_period;
 		cinfo->write_budget = cinfo->write_limit = cinfo->write_event->hw.sample_period;
@@ -1263,7 +1480,7 @@ int init_module( void )
 
 		/* initialize nmi irq_work_queue */
 		init_irq_work(&cinfo->read_pending, memguard_read_process_overflow);
-        	init_irq_work(&cinfo->write_pending, memguard_write_process_overflow);
+        init_irq_work(&cinfo->write_pending, memguard_write_process_overflow);
 
 		/* create and wake-up throttle threads */
 		cinfo->throttle_thread =
@@ -1271,10 +1488,10 @@ int init_module( void )
 					       (void *)((unsigned long)i),
 					       cpu_to_node(i),
 					       "kthrottle/%d", i);
-
+#ifndef FIRESIM
 		perf_event_enable(cinfo->read_event);
 		perf_event_enable(cinfo->write_event);	
-		
+#endif
 		BUG_ON(IS_ERR(cinfo->throttle_thread));
 		kthread_bind(cinfo->throttle_thread, i);
 		wake_up_process(cinfo->throttle_thread);
@@ -1282,11 +1499,20 @@ int init_module( void )
 
 	memguard_init_debugfs();
 
+
+
+
+#ifdef FIRESIM
+	for_each_online_cpu(i) {
+		WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(i), true); // Enable interrupts on all cores
+		PLIC_Setup(PLIC_BASE_ADDR, i); // Enable interrupts in PLIC
+	}
+#else
 	/* start timer and perf counters */
 	pr_info("Start period timer (period=%lld us)\n",
 		div64_u64(TM_NS(global->period_in_ktime), 1000));
 	on_each_cpu(__start_counter, NULL, 0);
-
+#endif
 	return 0;
 }
 
@@ -1302,6 +1528,14 @@ void cleanup_module( void )
 
 	/* destroy perf objects */
 	for_each_online_cpu(i) {
+
+#ifdef FIRESIM
+		/*
+			We should add custom cleanup here 
+		*/
+#endif
+
+
 		struct core_info *cinfo = per_cpu_ptr(core_info, i);
 		pr_info("Stopping kthrottle/%d\n", i);
 		kthread_stop(cinfo->throttle_thread);
@@ -1309,9 +1543,9 @@ void cleanup_module( void )
 		perf_event_release_kernel(cinfo->read_event); 
 		cinfo->read_event = NULL; 
         
-	        perf_event_disable(cinfo->write_event);
-       		perf_event_release_kernel(cinfo->write_event);
-        	cinfo->write_event = NULL;
+	    perf_event_disable(cinfo->write_event);
+       	perf_event_release_kernel(cinfo->write_event);
+        cinfo->write_event = NULL;
 	}
 
 	/* remove debugfs entries */

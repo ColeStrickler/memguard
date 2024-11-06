@@ -1,0 +1,62 @@
+#include <linux/interrupt.h>  // for request_irq, free_irq
+#include <linux/kernel.h>     // for printk
+#include <linux/module.h>     // for module initialization
+
+// IRQ number (replace with the actual IRQ number for your device)
+static int irq_number = 19; 
+
+// Interrupt handler
+static irqreturn_t irq_handler(int irq, void *dev_id) {
+    printk(KERN_INFO "IRQ Handler: Interrupt occurred!\n");
+    // Handle the interrupt
+    return IRQ_HANDLED;
+}
+
+// Module initialization (install the IRQ handler)
+static int __init irq_driver_init(void) {
+    int result;
+
+    // Request the IRQ
+    result = request_irq(irq_number, irq_handler, IRQF_SHARED, "my_irq_handler", (void *)(irq_handler));
+    if (result) {
+        printk(KERN_ERR "IRQ Handler: Failed to request IRQ %d\n", irq_number);
+        return result;
+    }
+
+    printk(KERN_INFO "IRQ Handler: Registered IRQ %d\n", irq_number);
+    return 0;  // Success
+}
+
+// Module cleanup (remove the IRQ handler)
+static void __exit irq_driver_exit(void) {
+    // Free the IRQ
+    free_irq(irq_number, (void *)(irq_handler));
+    printk(KERN_INFO "IRQ Handler: Unregistered IRQ %d\n", irq_number);
+}
+
+module_init(irq_driver_init);
+module_exit(irq_driver_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Your Name");
+MODULE_DESCRIPTION("Example IRQ Handler");
+
+
+
+Can we do something like this and avoid the perf events
+
+
+[NO INT ADDED]
+Welcome to Buildroot
+buildroot login: root
+# cat /proc/interrupts
+           CPU0       CPU1       CPU2       CPU3       
+  1:        154          0          0          0  SiFive PLIC   2 Edge      54000000.serial
+  2:        902          0          0          0  SiFive PLIC   1 Edge      iceblk
+  5:        246        195        142        171  RISC-V INTC   5 Edge      riscv-timer
+IPI0:        13         35         24         18  Rescheduling interrupts
+IPI1:       169        563         68        279  Function call interrupts
+IPI2:         0          0          0          0  CPU stop interrupts
+IPI3:         0          0          0          0  CPU stop (for crash dump) interrupts
+IPI4:         0          0          0          0  IRQ work interrupts
+IPI5:         0          0          0          0  Timer broadcast interrupts
