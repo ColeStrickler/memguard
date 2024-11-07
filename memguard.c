@@ -45,7 +45,7 @@
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
-
+#include <linux/io.h>
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(5, 0, 0)
 #  include <uapi/linux/sched/types.h>
@@ -70,26 +70,27 @@
 
 
 
-#define WRITE_BOOL(addr, value)(*(bool*)(addr) = value)
-#define WRITE_UINT8(addr, value)(*(uint8_t*)(addr) = value)
-#define WRITE_UINT16(addr, value)(*(uint16_t*)(addr) = value)
-#define WRITE_UINT32(addr, value)(*(uint32_t*)(addr) = value)
-#define WRITE_UINT64(addr, value)(*(uint64_t*)(addr) = value)
+#define WRITE_BOOL(addr, value)		(writeb(value, addr))
+#define WRITE_UINT8(addr, value)	(writeb(value, addr))
+#define WRITE_UINT16(addr, value)	(writew(value, addr))
+#define WRITE_UINT32(addr, value)	(writel(value, addr))
+#define WRITE_UINT64(addr, value)	(writeq(value, addr))
 
-#define READ_BOOL(addr)(*(bool*)(addr))
-#define READ_UINT8(addr)(*(uint8_t*)(addr))
-#define READ_UINT16(addr)(*(uint16_t*)(addr))
-#define READ_UINT32(addr)(*(uint32_t*)(addr))
-#define READ_UINT64(addr)(*(uint64_t*)(addr))
+#define READ_BOOL(addr)		(readb(addr))
+#define READ_UINT8(addr)	(readb(addr))
+#define READ_UINT16(addr)	(readw(addr))
+#define READ_UINT32(addr)	(readl(addr))
+#define READ_UINT64(addr)	(readq(addr))
 
 #ifdef FIRESIM
 
-uint64_t PLIC_physAddr = 0;
-uint64_t L2CACHE_physAddr = 0;
+void __iomem* PLIC_physAddr = NULL;
+void __iomem* L2CACHE_physAddr = NULL;
 #define PLIC_BASE_OFFSET 0xC000000
 #define PLIC_BASE_ADDR PLIC_physAddr // WE MUST MAP THIS INTO VIRTUAL ADDRESS SPACE
 #define PLIC_MAX_OFFSET 0x3FFFFFC
 #define L2CACHE_BASE_OFFSET 0x2010000
+#define L2CACHE_MAX_OFFSET 0xfff
 #define L2CACHE_BASE_ADDR L2CACHE_physAddr
 #define L2CACHE_ACCESS_COUNTER_ADDR(core) ((L2CACHE_BASE_ADDR + 0x20 + (core * 0x8)))
 #define L2CACHE_MISS_COUNTER_ADDR(core) ((L2CACHE_BASE_ADDR + 0x100 + (core * 0x8)))
@@ -97,6 +98,7 @@ uint64_t L2CACHE_physAddr = 0;
 #define L2CACHE_EN_CORE_INTERRUPT_ADDR(core) ((L2CACHE_BASE_ADDR + 0x308 + (core * 0x8)))
 #define L2CACHE_CORE_BUDGET_ADDR(core) ((L2CACHE_BASE_ADDR + 0X400 + (core * 8)))
 #define L2CACHE_PERIOD_LEN_ADDR ((L2CACHE_BASE_ADDR + 0x500))
+#define L2CACHE_DEFAULT_PERIOD 0x1000
 void PLIC_EnableSource(uint64_t base, int ctx, int src) 
 {
     uint64_t addr = base + 0x2000 + (ctx*0x80);
@@ -879,6 +881,7 @@ static struct perf_event *init_counter(int cpu, int budget, int counter_id, void
 {
 
 #ifdef FIRESIM // we do not have to deal with callbacks
+	pr_info("Writing initial budget of %d for CPU %d\n", budget, cpu);
 	WRITE_UINT32(L2CACHE_CORE_BUDGET_ADDR(cpu), budget);
 #else
 	struct perf_event *event = NULL;
@@ -1354,7 +1357,9 @@ int RegisterIRQ(struct core_info* cinfo, int cpunum, hwirq_handler handler)
         printk(KERN_ERR "Failed to request IRQ %d --> %d\n", irq, ret);
         return ret;
     }
+	
 	cinfo->irq = irq; // This is the virtual
+	pr_info("Successfully requested Linux IRQ %d\n", irq);
 	return 0; 
 }
 
@@ -1377,8 +1382,8 @@ int init_module( void )
 
 	struct memguard_info *global = &memguard_info;
 #ifdef FIRESIM
-	PLIC_physAddr = (uint64_t)phys_to_virt(PLIC_BASE_OFFSET);
-	L2CACHE_physAddr = (uint64_t)phys_to_virt(L2CACHE_BASE_OFFSET);
+	PLIC_physAddr = ioremap(PLIC_BASE_OFFSET, PLIC_MAX_OFFSET);
+	L2CACHE_physAddr = ioremap(L2CACHE_BASE_OFFSET, L2CACHE_MAX_OFFSET);
 
 	if (!PLIC_physAddr || ! L2CACHE_physAddr)
 	{
@@ -1421,7 +1426,11 @@ int init_module( void )
 
 #ifdef FIRESIM
 		pr_info("RegisterIRQ() for cpu %d\n", i);
-		RegisterIRQ(core_info, i, my_irq_handler);
+		if (RegisterIRQ(cinfo, i, my_irq_handler) < 0)
+		{
+			pr_info("Could not register irq for cpu %d\n", i);
+			return -1;
+		}
 		cinfo->cpunum = i;
 #endif
 		/* initialize counter h/w & event structure */
@@ -1432,7 +1441,7 @@ int init_module( void )
 		memset(cinfo, 0, sizeof(struct core_info));
 
 		/* create performance counter */
-		
+		pr_info("read_budget %d, write_budget %d\n", read_budget, write_budget);
 #ifndef FIRESIM // We are using only DRAM accesses
 		cinfo->read_event = init_counter(i, read_budget, g_read_counter_id,
 						 event_overflow_callback);
@@ -1446,14 +1455,18 @@ int init_module( void )
 #ifndef FIRESIM
 		if (!cinfo->read_event || !cinfo->write_event)
 			break;
-#endif
 		/* initialize budget */
-		cinfo->read_budget = cinfo->read_limit = cinfo->read_event->hw.sample_period;
+		cinfo->read_budget 	= cinfo->read_limit = cinfo->read_event->hw.sample_period;
 		cinfo->write_budget = cinfo->write_limit = cinfo->write_event->hw.sample_period;
+#else
+	cinfo->read_budget = read_budget;
+	cinfo->write_budget = write_budget;
+#endif
+		
 
 		/* throttled task pointer */
 		cinfo->throttled_task = NULL;
-
+		pr_info("Init waitqueue throttle_evt\n");
 		init_waitqueue_head(&cinfo->throttle_evt);
 
 		/* initialize statistics */
@@ -1504,9 +1517,13 @@ int init_module( void )
 
 #ifdef FIRESIM
 	for_each_online_cpu(i) {
+		pr_info("PLIC enable core %d interrupt\n", i);
 		WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(i), true); // Enable interrupts on all cores
 		PLIC_Setup(PLIC_BASE_ADDR, i); // Enable interrupts in PLIC
 	}
+	// Set period
+	WRITE_UINT64(L2CACHE_PERIOD_LEN_ADDR, L2CACHE_DEFAULT_PERIOD);
+
 #else
 	/* start timer and perf counters */
 	pr_info("Start period timer (period=%lld us)\n",

@@ -14,4 +14,4 @@ plic:
 
 
 clean:
-	make -C $(BLDDIR) M=$(PWD) clean
+	rm *.o *.ko *.mod.*
