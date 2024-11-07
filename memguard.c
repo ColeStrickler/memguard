@@ -495,6 +495,7 @@ static void event_write_overflow_callback(struct perf_event *event,
  */
 static void __unthrottle_core(void *info)
 {
+	struct memguard_info *global = &memguard_info;
 	struct core_info *cinfo = this_cpu_ptr(core_info);
 	if (cinfo->throttled_task) {
 		cinfo->exclusive_mode = 1;
@@ -506,6 +507,9 @@ static void __unthrottle_core(void *info)
 		cinfo->throttled_task = NULL;
 		DEBUG_RECLAIM(trace_printk("exclusive mode begin\n"));
 	}
+
+	cpumask_clear_cpu(cinfo->cpunum, global->throttle_mask);
+	
 }
 
 static void __newperiod(void *info)
@@ -617,7 +621,10 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 	*/
 	if (cpumask_test_cpu(smp_processor_id(), global->throttle_mask))
 	{
+		
 		memguard_on_each_cpu_mask(global->throttle_mask, __unthrottle_core, NULL, 0);
+		
+		// zero throttle mask? 
 	}
 #endif
 
