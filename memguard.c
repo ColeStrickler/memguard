@@ -348,7 +348,11 @@ static inline u64 memguard_read_event_used(struct core_info *cinfo)
 /** return used event in the current period */
 static inline u64 memguard_write_event_used(struct core_info *cinfo)
 {
+#ifdef FIRESIM
+	return 0;
+#else
 	return perf_event_count(cinfo->write_event) - cinfo->old_write_val;
+#endif
 }
 
 static void print_core_info(int cpu, struct core_info *cinfo)
@@ -366,15 +370,25 @@ void update_statistics(struct core_info *cinfo)
 	s64 read_new, write_new;
 	int read_used, write_used;
 
+
+
+/*
+	We will probably wanna alter this eventually
+*/
+#ifndef FIRESIM
 	read_new = perf_event_count(cinfo->read_event);
 	read_used = (int)(read_new - cinfo->old_read_val); 
-
+	write_new = perf_event_count(cinfo->write_event);
+	write_used = (int)(write_new - cinfo->old_write_val); 
+#else
+	read_used = memguard_read_event_used(cinfo);
+	write_used = memguard_write_event_used(cinfo);
+#endif
 	cinfo->old_read_val = read_new;
 	cinfo->overall.used_read_budget += read_used;
 	cinfo->overall.assigned_read_budget += cinfo->read_budget;
 	
-	write_new = perf_event_count(cinfo->write_event);
-	write_used = (int)(write_new - cinfo->old_write_val); 
+	
 
 	cinfo->old_write_val = write_new;
 	cinfo->overall.used_write_budget += write_used;
@@ -514,8 +528,8 @@ static void __unthrottle_core(void *info)
 
 static void __newperiod(void *info)
 {
-
-
+	// zero counters for new period
+	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR, true);
 	ktime_t start = ktime_get();
 	struct memguard_info *global = &memguard_info;
 	struct core_info *cinfo = this_cpu_ptr(core_info);
@@ -541,7 +555,9 @@ static void __newperiod(void *info)
  */
 static void memguard_read_process_overflow(struct irq_work *entry)
 {
+	
 	struct core_info *cinfo = this_cpu_ptr(core_info);
+	//pr_info("READ PROCESS OVERFLOW CPU %d accesses: %llu\n", cinfo->cpunum, READ_UINT64(L2CACHE_MISS_COUNTER_ADDR(cinfo->cpunum)));
 	struct memguard_info *global = &memguard_info;
 	ktime_t start;
 	s64 read_budget_used;//, write_budget_used;
@@ -566,7 +582,9 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 		if (cinfo->cur_read_budget < cinfo->read_budget) {
 			amount = cinfo->read_budget - cinfo->cur_read_budget;
 			cinfo->cur_read_budget += amount;
+#ifndef FIRESIM
 			local64_set(&cinfo->read_event->hw.period_left, amount);
+#endif
 			DEBUG_RECLAIM(trace_printk("locally reclaimed %d\n",
 						   amount));
 			return;
@@ -587,16 +605,19 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 				break;
 		}
 		if (amount > 0) {
+#ifndef FIRESIM
 			local64_set(&cinfo->read_event->hw.period_left, amount);
 			DEBUG_RECLAIM(trace_printk("globally reclaimed %d\n",
 						   amount));
+#endif
 			return;
 		}
 	}
 
     /* no more overflow interrupt -->  Will get reset on new period */
 #ifdef FIRESIM
-	WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(cinfo->cpunum), false);
+	// we should already disable this in hardware, no need to do this here
+	//WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(cinfo->cpunum), false);
 #else
 	local64_set(&cinfo->read_event->hw.period_left, 0xfffffff);
 #endif
@@ -614,20 +635,20 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 	}
 
 
-#ifdef FIRESIM
-	/*
-		If throttle mask is set and we get another interrupt, it means
-		that this is a new period and we unthrottle the CPU
-	*/
-	if (cpumask_test_cpu(smp_processor_id(), global->throttle_mask))
-	{
-		
-		memguard_on_each_cpu_mask(global->throttle_mask, __unthrottle_core, NULL, 0);
-		
-		// zero throttle mask? 
-	}
-#endif
-
+//#ifdef FIRESIM
+//	/*
+//		If throttle mask is set and we get another interrupt, it means
+//		that this is a new period and we unthrottle the CPU
+//	*/
+//	if (cpumask_test_cpu(smp_processor_id(), global->throttle_mask))
+//	{
+//		
+//		memguard_on_each_cpu_mask(global->throttle_mask, __unthrottle_core, NULL, 0);
+//		
+//		// zero throttle mask? 
+//	}
+//#endif
+//
 
 
 
@@ -635,9 +656,6 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 	cpumask_set_cpu(smp_processor_id(), global->throttle_mask);
 	smp_mb(); // w -> r ordering of the local cpu.
 
-
-
-#ifndef FIRESIM
 	if (cpumask_equal(global->throttle_mask, global->active_mask)) {
 		/* all other cores are alreay throttled */
 		if (g_use_exclusive == 2) {
@@ -658,7 +676,7 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 			return;
 		}
 	}
-#endif
+
 	if (cinfo->prev_read_throttle_error)
 		return;
 	/*
@@ -795,10 +813,14 @@ enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 	BUG_ON(!irqs_disabled());
 	// WARN_ON_ONCE(!in_interrupt());
 
+#ifndef FIRESIM
 	/* stop counter */
 	cinfo->read_event->pmu->stop(cinfo->read_event, PERF_EF_UPDATE);
 	cinfo->write_event->pmu->stop(cinfo->write_event, PERF_EF_UPDATE);
-
+#else
+	// stop counter
+	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR, true);
+#endif
 	/* forward timer */
 	orun = hrtimer_forward_now(timer, global->period_in_ktime);
 	BUG_ON(orun == 0);
@@ -841,7 +863,7 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 		cinfo->read_budget = max(cinfo->read_limit, 1);
 	if (cinfo->write_limit > 0)
 		cinfo->write_budget = max(cinfo->write_limit, 1);
-
+#ifndef FIRESIM
 	if (cinfo->read_event->hw.sample_period != cinfo->read_budget) {
 		/* new budget is assigned */
 		trace_printk("MSG: new budget %d is assigned\n", 
@@ -854,6 +876,7 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 				   cinfo->write_budget);
 		cinfo->write_event->hw.sample_period = cinfo->write_budget;
 	}
+#endif
 
 	/* per-task donation policy */
         if (g_use_reclaim) {
@@ -872,6 +895,7 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 	/* unthrottle tasks (if any) */
 	cinfo->throttled_task = NULL;
 
+#ifndef FIRESIM
         /* setup overflow interrupts except RT cores */
 	if (!cinfo->rtcore) {
 		/* setup an interrupt */
@@ -882,14 +906,22 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 	/* enable performance counter */
 	cinfo->read_event->pmu->start(cinfo->read_event, PERF_EF_RELOAD);
 	cinfo->write_event->pmu->start(cinfo->write_event, PERF_EF_RELOAD);
+#else
+	// begin counters again except for rtcore
+	if (!cinfo->rtcore)
+		WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(cinfo->cpunum), true); // Enable interrupts on core
+	else
+		WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(cinfo->cpunum), false); 
+	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR, false);
+#endif
 }
 
 static struct perf_event *init_counter(int cpu, int budget, int counter_id, void *callback)
 {
 
 #ifdef FIRESIM // we do not have to deal with callbacks
-	pr_info("Writing initial budget of %d for CPU %d\n", budget, cpu);
-	WRITE_UINT32(L2CACHE_CORE_BUDGET_ADDR(cpu), budget);
+	WRITE_UINT64(L2CACHE_CORE_BUDGET_ADDR(cpu), budget);
+	pr_info("Wrote initial budget of %llu for CPU %d\n", (int)READ_UINT64(L2CACHE_CORE_BUDGET_ADDR(cpu)), cpu);
 #else
 	struct perf_event *event = NULL;
 	struct perf_event_attr sched_perf_hw_attr = {
@@ -941,9 +973,10 @@ static void __start_counter(void *info)
 {
 	struct memguard_info *global = &memguard_info;
 	struct core_info *cinfo = this_cpu_ptr(core_info);
+#ifndef FIRESIM
 	BUG_ON(!cinfo->read_event);
         BUG_ON(!cinfo->write_event);
-
+#endif
 
 	/* initialize hr timer */
         hrtimer_init(&cinfo->hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
@@ -1044,7 +1077,11 @@ static void __update_budget(void *info)
 	}
 
 #ifdef FIRESIM
-	WRITE_UINT64(L2CACHE_CORE_BUDGET_ADDR(cinfo->cpunum), (unsigned long)info);
+	int i = 0;
+	for_each_online_cpu(i)
+	{
+		WRITE_UINT64(L2CACHE_CORE_BUDGET_ADDR(i), (unsigned long)info);
+	}
 #endif
 	cinfo->read_limit = (unsigned long)info;
 	DEBUG_USER(trace_printk("MSG: New read budget of Core%d is %d\n",
@@ -1319,8 +1356,8 @@ static int throttle_thread(void *arg)
 					 cinfo->throttled_task ||
 					 kthread_should_stop());
 
-		DEBUG(trace_printk("got an event\n"));
-
+		//DEBUG(trace_printk("got an event\n"));
+		trace_printk("got an event\n")
 		if (kthread_should_stop())
 			break;
 
@@ -1528,15 +1565,16 @@ int init_module( void )
 		WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(i), true); // Enable interrupts on all cores
 		PLIC_Setup(PLIC_BASE_ADDR, i); // Enable interrupts in PLIC
 	}
-	// Set period
-	WRITE_UINT64(L2CACHE_PERIOD_LEN_ADDR, L2CACHE_DEFAULT_PERIOD);
+	// Start new period
+	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR, true);
+	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR, false);
+#endif
 
-#else
 	/* start timer and perf counters */
 	pr_info("Start period timer (period=%lld us)\n",
 		div64_u64(TM_NS(global->period_in_ktime), 1000));
 	on_each_cpu(__start_counter, NULL, 0);
-#endif
+
 	return 0;
 }
 
