@@ -1357,7 +1357,7 @@ static int throttle_thread(void *arg)
 					 kthread_should_stop());
 
 		//DEBUG(trace_printk("got an event\n"));
-		trace_printk("got an event\n")
+		trace_printk("got an event\n");
 		if (kthread_should_stop())
 			break;
 
