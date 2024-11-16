@@ -1077,13 +1077,10 @@ static void __update_budget(void *info)
 	}
 
 #ifdef FIRESIM
-	int i = 0;
-	for_each_online_cpu(i)
-	{
-		WRITE_UINT64(L2CACHE_CORE_BUDGET_ADDR(i), (unsigned long)info);
-	}
+	WRITE_UINT64(L2CACHE_CORE_BUDGET_ADDR(smp_processor_id()), (unsigned long)info);
 #endif
 	cinfo->read_limit = (unsigned long)info;
+	pr_info("Budget update on %d of %d\n",smp_processor_id(), cinfo->read_limit);
 	DEBUG_USER(trace_printk("MSG: New read budget of Core%d is %d\n",
 				smp_processor_id(), cinfo->read_budget));
 
@@ -1098,7 +1095,7 @@ static void __update_write_budget(void *info)
 		return;
 	}
 #ifdef FIRESIM
-	WRITE_UINT64(L2CACHE_CORE_BUDGET_ADDR(cinfo->cpunum), (unsigned long)info);
+	WRITE_UINT64(L2CACHE_CORE_BUDGET_ADDR(smp_processor_id()), (unsigned long)info);
 #endif
 	cinfo->write_limit = (unsigned long)info;
 	DEBUG_USER(trace_printk("MSG: New write budget of Core%d is %d\n",
@@ -1394,7 +1391,7 @@ int RegisterIRQ(struct core_info* cinfo, int cpunum, hwirq_handler handler)
         pr_err("Failed to get IRQ from device tree\n");
         return irq;
     }
-    pr_info("Mapped hwirq to Linux IRQ: %d\n", irq);
+    pr_info("Mapped hwirq to Linux IRQ: %d for cpu %d\n", irq, cpunum);
 
     ret = request_irq(irq, handler, 0, "memguard", NULL);
     if (ret) {
@@ -1464,18 +1461,20 @@ int init_module( void )
 	core_info = alloc_percpu(struct core_info);
 
 	for_each_online_cpu(i) {
+		
 		struct core_info *cinfo = per_cpu_ptr(core_info, i);
 		int read_budget, write_budget;
 
 
 #ifdef FIRESIM
+		int cpunum = i;
 		pr_info("RegisterIRQ() for cpu %d\n", i);
-		if (RegisterIRQ(cinfo, i, my_irq_handler) < 0)
+		if (RegisterIRQ(cinfo, cpunum, my_irq_handler) < 0)
 		{
 			pr_info("Could not register irq for cpu %d\n", i);
 			return -1;
 		}
-		cinfo->cpunum = i;
+		cinfo->cpunum = cpunum;
 #endif
 		/* initialize counter h/w & event structure */
 		read_budget = convert_mb_to_events(DEFAULT_RD_BUDGET_MB);
@@ -1492,7 +1491,7 @@ int init_module( void )
 		cinfo->write_event = init_counter(i, write_budget, g_write_counter_id,
 						  event_write_overflow_callback);
 #else
-	init_counter(i, read_budget, g_read_counter_id,
+	init_counter(cpunum, read_budget, g_read_counter_id,
 						 event_overflow_callback);
 #endif
 
