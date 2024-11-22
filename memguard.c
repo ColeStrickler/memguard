@@ -819,7 +819,11 @@ enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 	cinfo->write_event->pmu->stop(cinfo->write_event, PERF_EF_UPDATE);
 #else
 	// stop counter
-	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(smp_processor_id()), true);
+
+	/*
+		We originally put this here, but we need to update statistics before we clear the counter
+	*/
+	//WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(smp_processor_id()), true);
 #endif
 	/* forward timer */
 	orun = hrtimer_forward_now(timer, global->period_in_ktime);
@@ -857,6 +861,11 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 
 	/* update statistics. */
 	update_statistics(cinfo);
+
+#ifdef FIRESIM
+	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(smp_processor_id()), true); // zero counters
+	smp_mb();
+#endif
 
 	/* new budget assignment from user */
 	if (cinfo->read_limit > 0)
