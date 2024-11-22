@@ -97,7 +97,7 @@ void __iomem* L2CACHE_physAddr = NULL;
 #define L2CACHE_EN_COUNT_INSTFETCH_ADDR ((L2CACHE_BASE_ADDR + 0x300))
 #define L2CACHE_EN_CORE_INTERRUPT_ADDR(core) ((L2CACHE_BASE_ADDR + 0x308 + (core * 0x8)))
 #define L2CACHE_CORE_BUDGET_ADDR(core) ((L2CACHE_BASE_ADDR + 0X400 + (core * 8)))
-#define L2CACHE_PERIOD_LEN_ADDR ((L2CACHE_BASE_ADDR + 0x500))
+#define L2CACHE_PERIOD_LEN_ADDR(core) ((L2CACHE_BASE_ADDR + 0x500 + (core * 8)))
 #define L2CACHE_DEFAULT_PERIOD 0x1000
 void PLIC_EnableSource(uint64_t base, int ctx, int src) 
 {
@@ -339,7 +339,7 @@ static inline u64 perf_event_count(struct perf_event *event)
 static inline u64 memguard_read_event_used(struct core_info *cinfo)
 {
 #ifdef FIRESIM
-	return READ_UINT64(L2CACHE_MISS_COUNTER_ADDR(cinfo->cpunum));
+	return READ_UINT64(L2CACHE_MISS_COUNTER_ADDR(smp_processor_id()));
 #else
 	return perf_event_count(cinfo->read_event) - cinfo->old_read_val;
 #endif
@@ -516,20 +516,20 @@ static void __unthrottle_core(void *info)
 		cinfo->exclusive_time = ktime_get();
 #ifdef FIRESIM
 		// Re-enable interrupts
-		WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(cinfo->cpunum), true);
+		// WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(smp_processor_id()), true);
 #endif
 		cinfo->throttled_task = NULL;
 		DEBUG_RECLAIM(trace_printk("exclusive mode begin\n"));
 	}
-
-	cpumask_clear_cpu(cinfo->cpunum, global->throttle_mask);
+	// We added this - not sure why?
+	// cpumask_clear_cpu(cinfo->cpunum, global->throttle_mask);
 	
 }
 
 static void __newperiod(void *info)
 {
 	// zero counters for new period
-	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR, true);
+	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(smp_processor_id()), true);
 	ktime_t start = ktime_get();
 	struct memguard_info *global = &memguard_info;
 	struct core_info *cinfo = this_cpu_ptr(core_info);
@@ -819,7 +819,7 @@ enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 	cinfo->write_event->pmu->stop(cinfo->write_event, PERF_EF_UPDATE);
 #else
 	// stop counter
-	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR, true);
+	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(smp_processor_id()), true);
 #endif
 	/* forward timer */
 	orun = hrtimer_forward_now(timer, global->period_in_ktime);
@@ -907,12 +907,8 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 	cinfo->read_event->pmu->start(cinfo->read_event, PERF_EF_RELOAD);
 	cinfo->write_event->pmu->start(cinfo->write_event, PERF_EF_RELOAD);
 #else
-	// begin counters again except for rtcore
-	if (!cinfo->rtcore)
-		WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(cinfo->cpunum), true); // Enable interrupts on core
-	else
-		WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(cinfo->cpunum), false); 
-	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR, false);
+	
+	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(smp_processor_id()), false);
 #endif
 }
 
@@ -1030,7 +1026,15 @@ static ssize_t memguard_control_write(struct file *filp,
 		int i, val;
 		sscanf(p+3, "%d %d", &i, &val);
 		if (i >=0 && i < num_online_cpus())
+		{
+			// if real time core, disable interrupts
 			per_cpu_ptr(core_info, i)->rtcore = val;
+			if (!val)
+				WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(i), true); // Enable interrupts on core
+			else
+				WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(i), false); 
+		}
+			
 	} else if (!strncmp(p, "reclaim ", 8))
 		sscanf(p+8, "%d", &g_use_reclaim);
 	else if (!strncmp(p, "exclusive ", 10))
@@ -1469,7 +1473,7 @@ int init_module( void )
 #ifdef FIRESIM
 		int cpunum = i;
 		pr_info("RegisterIRQ() for cpu %d\n", i);
-		if (RegisterIRQ(cinfo, cpunum, my_irq_handler) < 0)
+		if (RegisterIRQ(cinfo, smp_processor_id(), my_irq_handler) < 0)
 		{
 			pr_info("Could not register irq for cpu %d\n", i);
 			return -1;
@@ -1491,7 +1495,7 @@ int init_module( void )
 		cinfo->write_event = init_counter(i, write_budget, g_write_counter_id,
 						  event_write_overflow_callback);
 #else
-	init_counter(cpunum, read_budget, g_read_counter_id,
+	init_counter(smp_processor_id(), read_budget, g_read_counter_id,
 						 event_overflow_callback);
 #endif
 
@@ -1563,10 +1567,13 @@ int init_module( void )
 		pr_info("PLIC enable core %d interrupt\n", i);
 		WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(i), true); // Enable interrupts on all cores
 		PLIC_Setup(PLIC_BASE_ADDR, i); // Enable interrupts in PLIC
+
+		// Start new period
+		WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(i), true);
+		WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(i), false);
 	}
-	// Start new period
-	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR, true);
-	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR, false);
+	
+	
 #endif
 
 	/* start timer and perf counters */
@@ -1589,15 +1596,21 @@ void cleanup_module( void )
 
 	/* destroy perf objects */
 	for_each_online_cpu(i) {
-
+		struct core_info *cinfo = per_cpu_ptr(core_info, i);
 #ifdef FIRESIM
 		/*
 			We should add custom cleanup here 
 		*/
+		WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(i), false); // disable interrupts for core
+		WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(i), true); // hold period reset high to zero all counters 
+		free_irq(cinfo->irq, NULL); // free the allocated IRQ
+
+
+
 #endif
 
 
-		struct core_info *cinfo = per_cpu_ptr(core_info, i);
+		
 		pr_info("Stopping kthrottle/%d\n", i);
 		kthread_stop(cinfo->throttle_thread);
 		perf_event_disable(cinfo->read_event);
