@@ -83,7 +83,8 @@
 #define READ_UINT64(addr)	(readq(addr))
 
 #ifdef FIRESIM
-
+int switch_irq(void);
+void irq_set(int cpu, int irq, int src);
 void __iomem* PLIC_physAddr = NULL;
 void __iomem* L2CACHE_physAddr = NULL;
 #define PLIC_BASE_OFFSET 0xC000000
@@ -133,14 +134,14 @@ void PLIC_ClearPendingBit(uint64_t base, int src)
     WRITE_UINT32(addr, val);
 }
 
-void PLIC_Setup(uint64_t base, int cpu)
+void PLIC_Setup(uint64_t base, int cpu, int src)
 {
-	int pending = PLIC_ReadPendingBit(base, cpu+1);
+	int pending = PLIC_ReadPendingBit(base, src);
 	if (pending)
-		PLIC_ClearPendingBit(base, cpu+1);
-	PLIC_SetSourcePriority(base, cpu+1, 5);
+		PLIC_ClearPendingBit(base, src);
+	PLIC_SetSourcePriority(base, src, 5);
 	PLIC_SetContextThreshold(base, cpu, 0); // Let everything through > threshold 0=everything
-	PLIC_EnableSource(base, cpu, cpu+1); // Sources start from 1 not 0
+	PLIC_EnableSource(base, cpu, src); // Sources start from 1 not 0
 }
 
 #endif
@@ -339,7 +340,8 @@ static inline u64 perf_event_count(struct perf_event *event)
 static inline u64 memguard_read_event_used(struct core_info *cinfo)
 {
 #ifdef FIRESIM
-	return READ_UINT64(L2CACHE_MISS_COUNTER_ADDR(smp_processor_id()));
+	return READ_UINT64(L2CACHE_MISS_COUNTER_ADDR(cinfo->irq));
+	//return READ_UINT64(L2CACHE_MISS_COUNTER_ADDR(smp_processor_id()));
 #else
 	return perf_event_count(cinfo->read_event) - cinfo->old_read_val;
 #endif
@@ -529,10 +531,11 @@ static void __unthrottle_core(void *info)
 static void __newperiod(void *info)
 {
 	// zero counters for new period
-	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(smp_processor_id()), true);
+	struct core_info *cinfo = this_cpu_ptr(core_info);
+	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(cinfo->irq), true);
 	ktime_t start = ktime_get();
 	struct memguard_info *global = &memguard_info;
-	struct core_info *cinfo = this_cpu_ptr(core_info);
+	
 	
 	ktime_t new_expire = ktime_add(start, global->period_in_ktime);
 
@@ -862,8 +865,11 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 	/* update statistics. */
 	update_statistics(cinfo);
 
+	/*
+		Only zero counters after we have collected statistics
+	*/
 #ifdef FIRESIM
-	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(smp_processor_id()), true); // zero counters
+	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(cinfo->irq), true); // zero counters
 	smp_mb();
 #endif
 
@@ -917,7 +923,7 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 	cinfo->write_event->pmu->start(cinfo->write_event, PERF_EF_RELOAD);
 #else
 	
-	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(smp_processor_id()), false);
+	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(cinfo->irq), false);
 #endif
 }
 
@@ -1029,6 +1035,10 @@ static ssize_t memguard_control_write(struct file *filp,
 	char buf[BUF_SIZE];
 	char *p = buf;
 
+	int cpu = 0;
+	int irq = 0;
+	int src = 0;
+
 	if (copy_from_user(&buf, ubuf, (cnt > BUF_SIZE) ? BUF_SIZE: cnt) != 0)
 		return 0;
 	if (!strncmp(p, "rt ", 3)) {
@@ -1048,6 +1058,11 @@ static ssize_t memguard_control_write(struct file *filp,
 		sscanf(p+8, "%d", &g_use_reclaim);
 	else if (!strncmp(p, "exclusive ", 10))
 		sscanf(p+10, "%d", &g_use_exclusive);
+	else if (!strncmp(p, "irq ", 4))
+	{
+		sscanf(p+4, "%d %d %d", &cpu, &irq, &src);
+		irq_set(cpu, irq, src);
+	}
 	else
 		pr_info("ERROR: %s\n", p);
 	return cnt;
@@ -1090,7 +1105,7 @@ static void __update_budget(void *info)
 	}
 
 #ifdef FIRESIM
-	WRITE_UINT64(L2CACHE_CORE_BUDGET_ADDR(smp_processor_id()), (unsigned long)info);
+	WRITE_UINT64(L2CACHE_CORE_BUDGET_ADDR(cinfo->irq), (unsigned long)info);
 #endif
 	cinfo->read_limit = (unsigned long)info;
 	pr_info("Budget update on %d of %d\n",smp_processor_id(), cinfo->read_limit);
@@ -1108,7 +1123,7 @@ static void __update_write_budget(void *info)
 		return;
 	}
 #ifdef FIRESIM
-	WRITE_UINT64(L2CACHE_CORE_BUDGET_ADDR(smp_processor_id()), (unsigned long)info);
+	WRITE_UINT64(L2CACHE_CORE_BUDGET_ADDR(cinfo->irq), (unsigned long)info);
 #endif
 	cinfo->write_limit = (unsigned long)info;
 	DEBUG_USER(trace_printk("MSG: New write budget of Core%d is %d\n",
@@ -1385,8 +1400,21 @@ static int throttle_thread(void *arg)
 
 
 #ifdef FIRESIM
+/*
+	This does the same thing as event_overflow_callback()
+*/
+static irqreturn_t my_irq_handler(int irq, void *dev_id) {
+    struct core_info *cinfo = this_cpu_ptr(core_info);
+	BUG_ON(!cinfo);
+	irq_work_queue(&cinfo->read_pending);
+    return IRQ_HANDLED; // Return IRQ_HANDLED to indicate that it was handled
+}
+
+
+
+
 typedef irqreturn_t (*hwirq_handler)(int, void *);
-int RegisterIRQ(struct core_info* cinfo, int cpunum, hwirq_handler handler)
+int RegisterIRQ(struct core_info* cinfo, int cpunum, int irqWhich, hwirq_handler handler)
 {
     struct device_node *node;
     int ret = 0;
@@ -1399,7 +1427,7 @@ int RegisterIRQ(struct core_info* cinfo, int cpunum, hwirq_handler handler)
         return -ENODEV;
     }
 
-    irq = of_irq_get(node, cpunum);  // 0 = first interrupt in "interrupts" property
+    irq = of_irq_get(node, irqWhich);  // 0 = first interrupt in "interrupts" property
     if (irq < 0) {
         pr_err("Failed to get IRQ from device tree\n");
         return irq;
@@ -1412,22 +1440,76 @@ int RegisterIRQ(struct core_info* cinfo, int cpunum, hwirq_handler handler)
         return ret;
     }
 	
-	cinfo->irq = irq; // This is the virtual
+	cinfo->irq = irqWhich; // This is the virtual
 	pr_info("Successfully requested Linux IRQ %d\n", irq);
 	return 0; 
 }
 
 
-/*
-	This does the same thing as event_overflow_callback()
-*/
-static irqreturn_t my_irq_handler(int irq, void *dev_id) {
-    struct core_info *cinfo = this_cpu_ptr(core_info);
-	BUG_ON(!cinfo);
-	irq_work_queue(&cinfo->read_pending);
-    return IRQ_HANDLED; // Return IRQ_HANDLED to indicate that it was handled
+int switch_irq(void)
+{
+	int i = 0;
+	for_each_online_cpu(i) {
+		struct core_info *cinfo = per_cpu_ptr(core_info, i);
+		//pr_info("PLIC enable core %d interrupt\n", i);
+		WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(i), false); // Disable interrupts on all cores
+
+		// zero counters
+		WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(i), true);
+		//WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(i), false);
+		free_irq(cinfo->irq, NULL); // free the allocated IRQ
+		pr_info("Freeing IRQ %d on cpu %d", cinfo->irq, i);
+	}
+
+	int irq = 0;
+	// re-register IRQs backwards
+	for (i = num_online_cpus()-1; i >= 0; i--)
+	{
+		struct core_info *cinfo = per_cpu_ptr(core_info, i);
+		if (RegisterIRQ(cinfo, i, irq, my_irq_handler) < 0)
+		{
+			pr_info("Could not register irq for cpu %d\n", i);
+			return -1;
+		}
+		irq++;
+	}
+	i = 0;
+	/* restart counters and enable interrupts */
+	for_each_online_cpu(i) {
+		struct core_info *cinfo = per_cpu_ptr(core_info, i);
+		//pr_info("PLIC enable core %d interrupt\n", i);
+		WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(i), true); // Enable interrupts on all cores
+
+		// start new period
+		WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(i), true);
+		WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(i), false);
+	}
+
+	return 0;
 }
+
+
+void irq_set(int cpu, int irq, int src)
+{
+	struct core_info *cinfo = per_cpu_ptr(core_info, cpu);
+	cinfo->cpunum = cpu;
+	if (RegisterIRQ(cinfo, cpu, irq, my_irq_handler) == -1)
+	{
+		pr_info("Could not register irq for cpu %d\n", cpu);
+		return;
+	}
+	PLIC_Setup(PLIC_BASE_ADDR, cpu, src);
+
+	WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(cinfo->irq), true); // Enable interrupts on all cores
+	//	PLIC_Setup(PLIC_BASE_ADDR, i, src); // Enable interrupts in PLIC
+	//	src--;
+	//	// Start new period
+	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(cinfo->irq), true);
+	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(cinfo->irq), false);
+}
+
 #endif
+
 
 
 int init_module( void )
@@ -1472,7 +1554,6 @@ int init_module( void )
 
 	pr_info("Initilizing perf counter\n");
 	core_info = alloc_percpu(struct core_info);
-
 	for_each_online_cpu(i) {
 		
 		struct core_info *cinfo = per_cpu_ptr(core_info, i);
@@ -1481,12 +1562,12 @@ int init_module( void )
 
 #ifdef FIRESIM
 		int cpunum = i;
-		pr_info("RegisterIRQ() for cpu %d\n", i);
-		if (RegisterIRQ(cinfo, smp_processor_id(), my_irq_handler) < 0)
-		{
-			pr_info("Could not register irq for cpu %d\n", i);
-			return -1;
-		}
+		//pr_info("RegisterIRQ() for cpu %d\n", i);
+		//if (RegisterIRQ(cinfo, i, irq, my_irq_handler) < 0)
+		//{
+		//	pr_info("Could not register irq for cpu %d\n", i);
+		//	return -1;
+		//}
 		cinfo->cpunum = cpunum;
 #endif
 		/* initialize counter h/w & event structure */
@@ -1504,7 +1585,7 @@ int init_module( void )
 		cinfo->write_event = init_counter(i, write_budget, g_write_counter_id,
 						  event_write_overflow_callback);
 #else
-	init_counter(smp_processor_id(), read_budget, g_read_counter_id,
+	init_counter(i, read_budget, g_read_counter_id,
 						 event_overflow_callback);
 #endif
 
@@ -1571,16 +1652,17 @@ int init_module( void )
 
 
 
+int src = 1;
 #ifdef FIRESIM
-	for_each_online_cpu(i) {
-		pr_info("PLIC enable core %d interrupt\n", i);
-		WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(i), true); // Enable interrupts on all cores
-		PLIC_Setup(PLIC_BASE_ADDR, i); // Enable interrupts in PLIC
-
-		// Start new period
-		WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(i), true);
-		WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(i), false);
-	}
+	//for_each_online_cpu(i) {
+	//	pr_info("PLIC enable core %d interrupt\n", i);
+	//	WRITE_BOOL(L2CACHE_EN_CORE_INTERRUPT_ADDR(i), true); // Enable interrupts on all cores
+	//	PLIC_Setup(PLIC_BASE_ADDR, i, src); // Enable interrupts in PLIC
+	//	src--;
+	//	// Start new period
+	//	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(i), true);
+	//	WRITE_BOOL(L2CACHE_PERIOD_LEN_ADDR(i), false);
+	//}
 	
 	
 #endif
